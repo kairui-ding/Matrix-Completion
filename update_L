@@ -1,0 +1,599 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Key changes:
+# 1) lambda is set on the theorem/noise scale by default instead of a fixed 0.5.
+# 2) Stage 2 is a true debias/refit stage:
+#      - soft refit with much smaller lambda, or
+#      - hard rank-r refit (SVP) to remove soft-thresholding bias.
+# 3) Oracle L-only recovery using true A,B,C is included for debugging/baseline.
+# ============================================================
+
+
+def fro_norm(X):
+    return np.linalg.norm(X, ord="fro")
+
+
+def relative_fro_error(X_hat, X_true, eps=1e-12):
+    return fro_norm(X_hat - X_true) / (fro_norm(X_true) + eps)
+
+
+def projector_onto_colspace(X):
+    return X @ np.linalg.pinv(X.T @ X) @ X.T
+
+
+def projector_onto_orthogonal_complement(X):
+    n = X.shape[0]
+    return np.eye(n) - projector_onto_colspace(X)
+
+
+def project_B_to_feasible(B, PZ_perp):
+    return PZ_perp @ B
+
+
+def project_C_to_feasible(C, PW_perp):
+    return PW_perp @ C
+
+
+def project_L_to_feasible(L, PW_perp, PZ_perp):
+    return PW_perp @ L @ PZ_perp
+
+
+def singular_value_thresholding(Y, tau):
+    U, S, Vh = np.linalg.svd(Y, full_matrices=False)
+    S_thresh = np.maximum(S - tau, 0.0)
+    return U @ np.diag(S_thresh) @ Vh
+
+
+def singular_value_projection(Y, rank):
+    U, S, Vh = np.linalg.svd(Y, full_matrices=False)
+    k = min(int(rank), len(S))
+    if k <= 0:
+        return np.zeros_like(Y)
+    return U[:, :k] @ np.diag(S[:k]) @ Vh[:k, :]
+
+
+def numerical_rank(X, rel_thresh=1e-3):
+    s = np.linalg.svd(X, compute_uv=False)
+    if s.size == 0 or s[0] <= 1e-15:
+        return 0
+    return int(np.sum(s > rel_thresh * s[0]))
+
+
+def recommended_lambda(sigma, n1, n2, p_obs, c_lambda=5.0):
+    """
+    Theorem-style scale: lambda ~ C * sigma * sqrt((n1 v n2) * p).
+    Tune c_lambda in [2, 10] depending on noise level.
+    """
+    return c_lambda * sigma * np.sqrt(max(n1, n2) * p_obs)
+
+
+# ------------------------------------------------------------
+# Model pieces
+# ------------------------------------------------------------
+def component_interaction(W, Z, A):
+    return W @ A @ Z.T
+
+
+def component_B(W, B):
+    return W @ B.T
+
+
+def component_C(C, Z):
+    return C @ Z.T
+
+
+def compose_matrix(W, Z, A, B, C, L):
+    return component_interaction(W, Z, A) + component_B(W, B) + component_C(C, Z) + L
+
+
+def component_norms(W, Z, A, B, C, L):
+    return {
+        "WAZ": fro_norm(component_interaction(W, Z, A)),
+        "WBt": fro_norm(component_B(W, B)),
+        "CZT": fro_norm(component_C(C, Z)),
+        "L": fro_norm(L),
+    }
+
+
+# ------------------------------------------------------------
+# Initialization
+# ------------------------------------------------------------
+def scaled_relative_perturbation(base, noise, rel_level=0.5, eps=1e-12):
+    base_norm = fro_norm(base)
+    noise_norm = fro_norm(noise)
+    if noise_norm < eps:
+        return base.copy()
+    if base_norm < eps:
+        return noise.copy()
+    alpha = rel_level * base_norm / (noise_norm + eps)
+    return base + alpha * noise
+
+
+def initialize_parameters(init_mode, A_true, B_true, C_true, L_true, W, Z, rng):
+    PW_perp = projector_onto_orthogonal_complement(W)
+    PZ_perp = projector_onto_orthogonal_complement(Z)
+
+    if init_mode == "near_truth":
+        rel_level = 0.5
+        E_A = rng.standard_normal(size=A_true.shape)
+        A0 = scaled_relative_perturbation(A_true, E_A, rel_level=rel_level)
+
+        E_B = rng.standard_normal(size=B_true.shape)
+        E_B_feas = project_B_to_feasible(E_B, PZ_perp)
+        B0 = scaled_relative_perturbation(B_true, E_B_feas, rel_level=rel_level)
+        B0 = project_B_to_feasible(B0, PZ_perp)
+
+        E_C = rng.standard_normal(size=C_true.shape)
+        E_C_feas = project_C_to_feasible(E_C, PW_perp)
+        C0 = scaled_relative_perturbation(C_true, E_C_feas, rel_level=rel_level)
+        C0 = project_C_to_feasible(C0, PW_perp)
+
+        E_L = rng.standard_normal(size=L_true.shape)
+        E_L_feas = project_L_to_feasible(E_L, PW_perp, PZ_perp)
+        L0 = scaled_relative_perturbation(L_true, E_L_feas, rel_level=rel_level)
+        L0 = project_L_to_feasible(L0, PW_perp, PZ_perp)
+
+    elif init_mode == "random_feasible":
+        A0 = rng.standard_normal(size=A_true.shape)
+        B0 = project_B_to_feasible(rng.standard_normal(size=B_true.shape), PZ_perp)
+        C0 = project_C_to_feasible(rng.standard_normal(size=C_true.shape), PW_perp)
+        L0 = project_L_to_feasible(rng.standard_normal(size=L_true.shape), PW_perp, PZ_perp)
+    else:
+        raise ValueError("init_mode must be 'near_truth' or 'random_feasible'")
+
+    return A0, B0, C0, L0
+
+
+# ------------------------------------------------------------
+# Automatic step sizes
+# ------------------------------------------------------------
+def compute_step_sizes(W, Z, p_obs, cA=0.3, cB=0.3, cC=0.3, cL=0.2):
+    n1 = W.shape[0]
+    op_W = np.linalg.norm(W.T @ W, 2)
+    op_Z = np.linalg.norm(Z.T @ Z, 2)
+    L_A = (op_W * op_Z) / (n1 * p_obs)
+    L_B = op_W / p_obs
+    L_C = op_Z / p_obs
+    L_L = 1.0 / p_obs
+    eta_A = cA / (L_A + 1e-12)
+    eta_B = cB / (L_B + 1e-12)
+    eta_C = cC / (L_C + 1e-12)
+    eta_L = cL / (L_L + 1e-12)
+    return eta_A, eta_B, eta_C, eta_L
+
+
+def compute_L_only_step_size(p_obs, cL=0.8):
+    return cL * p_obs
+
+
+# ------------------------------------------------------------
+# Simulation
+# ------------------------------------------------------------
+def generate_feasible_truth(
+    n1, n2, d1, d2, r_true, rng,
+    scale_A=1.0, scale_B=1.0, scale_C=1.0, scale_L=1.0
+):
+    W = rng.standard_normal((n1, d1))
+    Z = rng.standard_normal((n2, d2))
+    W = W / np.sqrt(n1)
+    Z = Z / np.sqrt(n2)
+
+    PW_perp = projector_onto_orthogonal_complement(W)
+    PZ_perp = projector_onto_orthogonal_complement(Z)
+
+    A_true = scale_A * rng.standard_normal((d1, d2))
+    B_true = scale_B * project_B_to_feasible(rng.standard_normal((n2, d1)), PZ_perp)
+    C_true = scale_C * project_C_to_feasible(rng.standard_normal((n1, d2)), PW_perp)
+
+    U0 = rng.standard_normal((n1, r_true))
+    V0 = rng.standard_normal((n2, r_true))
+    U_feas = PW_perp @ U0
+    V_feas = PZ_perp @ V0
+    U_true, _ = np.linalg.qr(U_feas)
+    V_true, _ = np.linalg.qr(V_feas)
+    sing_vals = np.linspace(2.0, 1.0, r_true)
+    Sigma = np.diag(scale_L * sing_vals)
+    L_true = U_true[:, :r_true] @ Sigma @ V_true[:, :r_true].T
+    L_true = project_L_to_feasible(L_true, PW_perp, PZ_perp)
+
+    return W, Z, A_true, B_true, C_true, L_true
+
+
+def generate_observed_data(M_true, p_obs, sigma, rng):
+    noise = rng.normal(0.0, sigma, size=M_true.shape)
+    M_noisy = M_true + noise
+    mask = (rng.random(M_true.shape) < p_obs).astype(float)
+    M_obs = mask * M_noisy
+    return M_obs, mask
+
+
+# ------------------------------------------------------------
+# Objectives and diagnostics
+# ------------------------------------------------------------
+def objective_value_full(A, B, C, L, W, Z, M_obs, mask, p_obs, lambda_val):
+    D = compose_matrix(W, Z, A, B, C, L)
+    R = mask * (D - M_obs)
+    nuc_L = np.sum(np.linalg.svd(L, compute_uv=False))
+    return (0.5 / p_obs) * np.sum(R ** 2) + (lambda_val / p_obs) * nuc_L
+
+
+def objective_value_L_only(L, R_ABC_obs, mask, p_obs, lambda_val=0.0):
+    resid = mask * (L - R_ABC_obs)
+    nuc_L = np.sum(np.linalg.svd(L, compute_uv=False))
+    return (0.5 / p_obs) * np.sum(resid ** 2) + (lambda_val / p_obs) * nuc_L
+
+
+def check_feasibility(B, C, L, W, Z):
+    print("||Z^T B||_F =", fro_norm(Z.T @ B))
+    print("||W^T C||_F =", fro_norm(W.T @ C))
+    print("||W^T L||_F =", fro_norm(W.T @ L))
+    print("||L Z||_F   =", fro_norm(L @ Z))
+
+
+# ------------------------------------------------------------
+# Stage 1: Joint full-model solver
+# ------------------------------------------------------------
+def solve_full_model_convex_stage1(
+    M_obs,
+    mask,
+    W,
+    Z,
+    A_true,
+    B_true,
+    C_true,
+    L_true,
+    lambda_val,
+    init_mode="near_truth",
+    max_iter=500,
+    tol=1e-7,
+    min_iter_before_stop=30,
+    verbose=True,
+    rng=None,
+    cA=0.3,
+    cB=0.3,
+    cC=0.3,
+    cL=0.2,
+):
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    n1 = W.shape[0]
+    p_obs = float(np.mean(mask))
+    PW_perp = projector_onto_orthogonal_complement(W)
+    PZ_perp = projector_onto_orthogonal_complement(Z)
+    eta_A, eta_B, eta_C, eta_L = compute_step_sizes(W, Z, p_obs, cA=cA, cB=cB, cC=cC, cL=cL)
+    A, B, C, L = initialize_parameters(init_mode, A_true, B_true, C_true, L_true, W, Z, rng)
+    M_true = compose_matrix(W, Z, A_true, B_true, C_true, L_true)
+
+    stats = {"obj": [], "err_A": [], "err_B": [], "err_C": [], "err_L": [], "err_D": [], "rank_L": []}
+
+    for t in range(max_iter):
+        A_old, B_old, C_old, L_old = A.copy(), B.copy(), C.copy(), L.copy()
+
+        D = compose_matrix(W, Z, A, B, C, L)
+        R = mask * (D - M_obs)
+        grad_A = (W.T @ R @ Z) / p_obs
+        A = A - (eta_A / n1) * grad_A
+
+        D = compose_matrix(W, Z, A, B, C, L)
+        R = mask * (D - M_obs)
+        grad_B = (R.T @ W) / p_obs
+        B = project_B_to_feasible(B - eta_B * grad_B, PZ_perp)
+
+        D = compose_matrix(W, Z, A, B, C, L)
+        R = mask * (D - M_obs)
+        grad_C = (R @ Z) / p_obs
+        C = project_C_to_feasible(C - eta_C * grad_C, PW_perp)
+
+        D = compose_matrix(W, Z, A, B, C, L)
+        R = mask * (D - M_obs)
+        G_L = L - eta_L * (R / p_obs)
+        G_L = project_L_to_feasible(G_L, PW_perp, PZ_perp)
+        L = singular_value_thresholding(G_L, eta_L * lambda_val / p_obs)
+        # If G_L is feasible, SVT preserves feasibility; keep one projection for numerical stability.
+        L = project_L_to_feasible(L, PW_perp, PZ_perp)
+
+        D_new = compose_matrix(W, Z, A, B, C, L)
+        obj = objective_value_full(A, B, C, L, W, Z, M_obs, mask, p_obs, lambda_val)
+        err_A = relative_fro_error(A, A_true)
+        err_B = relative_fro_error(B, B_true)
+        err_C = relative_fro_error(C, C_true)
+        err_L = relative_fro_error(L, L_true)
+        err_D = relative_fro_error(D_new, M_true)
+
+        stats["obj"].append(obj)
+        stats["err_A"].append(err_A)
+        stats["err_B"].append(err_B)
+        stats["err_C"].append(err_C)
+        stats["err_L"].append(err_L)
+        stats["err_D"].append(err_D)
+        stats["rank_L"].append(numerical_rank(L))
+
+        rel_change = max(
+            fro_norm(A - A_old) / (fro_norm(A_old) + 1e-12),
+            fro_norm(B - B_old) / (fro_norm(B_old) + 1e-12),
+            fro_norm(C - C_old) / (fro_norm(C_old) + 1e-12),
+            fro_norm(L - L_old) / (fro_norm(L_old) + 1e-12),
+        )
+
+        if verbose and ((t + 1) % 10 == 0 or t == 0):
+            print(
+                f"[Stage 1] Iter {t+1:4d} | obj = {obj:.6e} | err_D = {err_D:.4e} | "
+                f"err_A = {err_A:.4e} | err_B = {err_B:.4e} | err_C = {err_C:.4e} | "
+                f"err_L = {err_L:.4e} | rank(L) = {stats['rank_L'][-1]} | rel_change = {rel_change:.3e}"
+            )
+
+        if (t + 1 >= min_iter_before_stop) and (rel_change < tol):
+            print(f"[Stage 1] Converged at iteration {t+1}")
+            break
+
+    return A, B, C, L, stats
+
+
+# ------------------------------------------------------------
+# Stage 2: debiased L-only refit
+# ------------------------------------------------------------
+def refit_L_only_stage2(
+    M_obs,
+    mask,
+    W,
+    Z,
+    A_fixed,
+    B_fixed,
+    C_fixed,
+    L_init,
+    L_true,
+    lambda_refit=0.0,
+    method="hard_rank",
+    rank_refit=None,
+    max_iter=400,
+    tol=1e-7,
+    min_iter_before_stop=30,
+    verbose=True,
+    cL_refit=0.8,
+):
+    """
+    method='soft'      : proximal SVT refit with smaller lambda_refit.
+    method='hard_rank' : singular value projection (hard threshold) debias step.
+                         This is usually much better for simulation baselines if rank is known.
+    """
+    p_obs = float(np.mean(mask))
+    PW_perp = projector_onto_orthogonal_complement(W)
+    PZ_perp = projector_onto_orthogonal_complement(Z)
+
+    ABC_fit = component_interaction(W, Z, A_fixed) + component_B(W, B_fixed) + component_C(C_fixed, Z)
+    R_ABC_obs = M_obs - mask * ABC_fit
+
+    eta_L = compute_L_only_step_size(p_obs, cL=cL_refit)
+    L = project_L_to_feasible(L_init.copy(), PW_perp, PZ_perp)
+
+    if method == "hard_rank" and rank_refit is None:
+        rank_refit = numerical_rank(L_init)
+
+    stats = {"obj": [], "err_L": [], "rank_L": [], "eta_L": eta_L}
+
+    for t in range(max_iter):
+        L_old = L.copy()
+        grad = mask * (L - R_ABC_obs) / p_obs
+        G = L - eta_L * grad
+        G = project_L_to_feasible(G, PW_perp, PZ_perp)
+
+        if method == "soft":
+            L = singular_value_thresholding(G, eta_L * lambda_refit / p_obs)
+        elif method == "hard_rank":
+            L = singular_value_projection(G, rank_refit)
+        else:
+            raise ValueError("method must be 'soft' or 'hard_rank'")
+
+        L = project_L_to_feasible(L, PW_perp, PZ_perp)
+
+        obj = objective_value_L_only(L, R_ABC_obs, mask, p_obs, lambda_refit if method == "soft" else 0.0)
+        err_L = relative_fro_error(L, L_true)
+        rank_L = numerical_rank(L)
+        stats["obj"].append(obj)
+        stats["err_L"].append(err_L)
+        stats["rank_L"].append(rank_L)
+
+        rel_change = fro_norm(L - L_old) / (fro_norm(L_old) + 1e-12)
+        if verbose and ((t + 1) % 10 == 0 or t == 0):
+            tag = "soft" if method == "soft" else f"hard-rank({rank_refit})"
+            print(
+                f"[Stage 2/{tag}] Iter {t+1:4d} | obj = {obj:.6e} | err_L = {err_L:.4e} | "
+                f"rank(L) = {rank_L} | rel_change = {rel_change:.3e}"
+            )
+
+        if (t + 1 >= min_iter_before_stop) and (rel_change < tol):
+            print(f"[Stage 2/{method}] Converged at iteration {t+1}")
+            break
+
+    return L, stats
+
+
+# ------------------------------------------------------------
+# Oracle residual baseline for debugging L recovery
+# ------------------------------------------------------------
+def recover_L_oracle_from_true_ABC(
+    M_obs,
+    mask,
+    W,
+    Z,
+    A_true,
+    B_true,
+    C_true,
+    L_init,
+    L_true,
+    method="hard_rank",
+    rank_refit=None,
+    lambda_refit=0.0,
+    max_iter=400,
+    verbose=True,
+):
+    return refit_L_only_stage2(
+        M_obs=M_obs,
+        mask=mask,
+        W=W,
+        Z=Z,
+        A_fixed=A_true,
+        B_fixed=B_true,
+        C_fixed=C_true,
+        L_init=L_init,
+        L_true=L_true,
+        lambda_refit=lambda_refit,
+        method=method,
+        rank_refit=rank_refit,
+        max_iter=max_iter,
+        verbose=verbose,
+    )
+
+
+# ------------------------------------------------------------
+# Demo main
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    rng = np.random.default_rng(42)
+
+    n1 = 120
+    n2 = 140
+    d1 = 5
+    d2 = 6
+    r_true = 3
+    p_obs = 0.30
+    sigma = 1e-3
+
+    scale_A = 2.0
+    scale_B = 1.2
+    scale_C = 1.2
+    scale_L = 3.0
+
+    W, Z, A_true, B_true, C_true, L_true = generate_feasible_truth(
+        n1=n1, n2=n2, d1=d1, d2=d2, r_true=r_true, rng=rng,
+        scale_A=scale_A, scale_B=scale_B, scale_C=scale_C, scale_L=scale_L
+    )
+
+    M_true = compose_matrix(W, Z, A_true, B_true, C_true, L_true)
+    M_obs, mask = generate_observed_data(M_true, p_obs=p_obs, sigma=sigma, rng=rng)
+
+    # Use theorem/noise scale instead of a fixed 0.5.
+    lambda_stage1 = recommended_lambda(sigma=sigma, n1=n1, n2=n2, p_obs=p_obs, c_lambda=5.0)
+    lambda_stage2_soft = 0.1 * lambda_stage1
+
+    print("===================================================")
+    print("Revised two-stage solver")
+    print("===================================================")
+    print(f"n1={n1}, n2={n2}, d1={d1}, d2={d2}, r_true={r_true}")
+    print(f"p_obs={p_obs}, sigma={sigma}")
+    print(f"lambda_stage1 (recommended) = {lambda_stage1:.6e}")
+    print(f"lambda_stage2_soft         = {lambda_stage2_soft:.6e}")
+    print()
+
+    print("Truth feasibility check:")
+    check_feasibility(B_true, C_true, L_true, W, Z)
+    print("True component Frobenius norms:")
+    print(component_norms(W, Z, A_true, B_true, C_true, L_true))
+    print()
+
+    A_hat1, B_hat1, C_hat1, L_hat1, stats1 = solve_full_model_convex_stage1(
+        M_obs=M_obs,
+        mask=mask,
+        W=W,
+        Z=Z,
+        A_true=A_true,
+        B_true=B_true,
+        C_true=C_true,
+        L_true=L_true,
+        lambda_val=lambda_stage1,
+        init_mode="near_truth",
+        max_iter=400,
+        tol=1e-7,
+        min_iter_before_stop=30,
+        verbose=True,
+        rng=np.random.default_rng(123),
+        cA=0.3,
+        cB=0.3,
+        cC=0.3,
+        cL=0.2,
+    )
+
+    D_hat1 = compose_matrix(W, Z, A_hat1, B_hat1, C_hat1, L_hat1)
+    print("\nStage 1 final relative errors:")
+    print(f"rel_err(A) = {relative_fro_error(A_hat1, A_true):.6f}")
+    print(f"rel_err(B) = {relative_fro_error(B_hat1, B_true):.6f}")
+    print(f"rel_err(C) = {relative_fro_error(C_hat1, C_true):.6f}")
+    print(f"rel_err(L) = {relative_fro_error(L_hat1, L_true):.6f}")
+    print(f"rel_err(D) = {relative_fro_error(D_hat1, M_true):.6f}")
+    print(f"rank(L_hat1) = {numerical_rank(L_hat1)}")
+    print(component_norms(W, Z, A_hat1, B_hat1, C_hat1, L_hat1))
+    print()
+
+    # Stage 2 practical soft debias with smaller lambda.
+    L_hat2_soft, stats2_soft = refit_L_only_stage2(
+        M_obs=M_obs,
+        mask=mask,
+        W=W,
+        Z=Z,
+        A_fixed=A_hat1,
+        B_fixed=B_hat1,
+        C_fixed=C_hat1,
+        L_init=L_hat1,
+        L_true=L_true,
+        lambda_refit=lambda_stage2_soft,
+        method="soft",
+        rank_refit=None,
+        max_iter=200,
+        verbose=True,
+    )
+
+    # Stage 2 practical hard-rank debias (recommended for simulation baseline).
+    L_hat2_hard, stats2_hard = refit_L_only_stage2(
+        M_obs=M_obs,
+        mask=mask,
+        W=W,
+        Z=Z,
+        A_fixed=A_hat1,
+        B_fixed=B_hat1,
+        C_fixed=C_hat1,
+        L_init=L_hat1,
+        L_true=L_true,
+        lambda_refit=0.0,
+        method="hard_rank",
+        rank_refit=r_true,
+        max_iter=200,
+        verbose=True,
+    )
+
+    # Oracle L-only baseline: subtract true A,B,C and recover L.
+    L_oracle, stats_oracle = recover_L_oracle_from_true_ABC(
+        M_obs=M_obs,
+        mask=mask,
+        W=W,
+        Z=Z,
+        A_true=A_true,
+        B_true=B_true,
+        C_true=C_true,
+        L_init=L_hat1,
+        L_true=L_true,
+        method="hard_rank",
+        rank_refit=r_true,
+        lambda_refit=0.0,
+        max_iter=200,
+        verbose=True,
+    )
+
+    print("\nStage 2 summary:")
+    print(f"soft debias   rel_err(L) = {relative_fro_error(L_hat2_soft, L_true):.6f}")
+    print(f"hard-rank     rel_err(L) = {relative_fro_error(L_hat2_hard, L_true):.6f}")
+    print(f"oracle hard   rel_err(L) = {relative_fro_error(L_oracle, L_true):.6f}")
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(stats1["err_L"], label="Stage 1 L error")
+    plt.plot(stats2_soft["err_L"], label="Stage 2 soft-debias L error")
+    plt.plot(stats2_hard["err_L"], label="Stage 2 hard-rank L error")
+    plt.plot(stats_oracle["err_L"], label="Oracle hard-rank L error")
+    plt.yscale("log")
+    plt.grid(True)
+    plt.legend()
+    plt.title("L recovery error across stages")
+    plt.tight_layout()
+    plt.show()
